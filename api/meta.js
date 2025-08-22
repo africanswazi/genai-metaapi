@@ -1,30 +1,45 @@
 // api/meta.js
 const express = require('express');
 const router  = express.Router();
-const https   = require('https');
 
-// ---------- ENV & TLS/Agent ----------
-const TOKEN = process.env.METAAPI_TOKEN || '';
+// ---------- ENV ----------
+const TOKEN    = process.env.METAAPI_TOKEN || '';
 const INSECURE = String(process.env.METAAPI_INSECURE || '').trim() === '1';
+const REGION   = (process.env.METAAPI_REGION || 'london').toLowerCase();
 
-// allow Node native fetch to use a custom agent (skip TLS if requested)
-const baseAgent = new https.Agent({ rejectUnauthorized: !INSECURE });
+// ---------- Undici dispatcher (preferred for Node 20 fetch) ----------
+let localDispatcher = null;
+let dispatcherType  = 'none';
 
-// optional proxy agent if you later set METAAPI_HTTP_PROXY (not required now)
-let proxyAgent = null;
-if (process.env.METAAPI_HTTP_PROXY) {
-  try {
-    const { HttpsProxyAgent } = require('https-proxy-agent');
-    proxyAgent = new HttpsProxyAgent(process.env.METAAPI_HTTP_PROXY);
-  } catch {}
+try {
+  const dns = require('dns');
+  const { Agent, ProxyAgent } = require('undici');
+  const lookupIPv4 = (host, _opts, cb) => dns.lookup(host, { family: 4 }, cb);
+
+  if (process.env.METAAPI_HTTP_PROXY) {
+    // Optional proxy support if you later set METAAPI_HTTP_PROXY
+    localDispatcher = new ProxyAgent(process.env.METAAPI_HTTP_PROXY, {
+      connect: { rejectUnauthorized: !INSECURE, lookup: lookupIPv4 }
+    });
+    dispatcherType = 'ProxyAgent';
+  } else {
+    localDispatcher = new Agent({
+      connect: { rejectUnauthorized: !INSECURE, lookup: lookupIPv4 }
+    });
+    dispatcherType = 'Agent';
+  }
+} catch {
+  // If undici isn't available for some reason, we just won't attach a dispatcher
+  localDispatcher = null;
+  dispatcherType  = 'none';
 }
 
-const pickAgent = () => proxyAgent || baseAgent;
+const pickDispatcher = () => localDispatcher || undefined;
 
-// global fetch shim
+// ---------- fetch shim (Node 20 has global fetch) ----------
 const fetchAny = (...args) =>
-  (globalThis.fetch ? globalThis.fetch(...args) :
-    import('node-fetch').then(({default: f}) => f(...args)));
+  (globalThis.fetch ? globalThis.fetch(...args)
+                    : import('node-fetch').then(({ default: f }) => f(...args)));
 
 const authHeaders = () => ({
   'Authorization': `Bearer ${TOKEN}`,
@@ -32,8 +47,6 @@ const authHeaders = () => ({
 });
 
 // ---------- Bases & Prefixes (env-driven, with sane fallbacks) ----------
-const REGION = (process.env.METAAPI_REGION || 'london').toLowerCase();
-
 const CLIENT_BASES = [
   process.env.METAAPI_CLIENT_BASE || `https://mt-client-api-v1.${REGION}.agiliumtrade.ai`,
   'https://api.metaapi.cloud'
@@ -45,8 +58,8 @@ const CLIENT_PREFIXES = [
 ];
 
 const PROV_BASES = [
-  process.env.METAAPI_PROVISIONING_BASE || 'https://api.metaapi.cloud', // aggregator is most reliable on shared hosts
-  `https://mt-provisioning-api-v1.agiliumtrade.ai`
+  process.env.METAAPI_PROVISIONING_BASE || 'https://api.metaapi.cloud',
+  'https://mt-provisioning-api-v1.agiliumtrade.ai'
 ];
 
 const PROV_PREFIXES = [
@@ -56,16 +69,21 @@ const PROV_PREFIXES = [
 
 // ---------- helpers ----------
 async function tryFetch(url, init = {}) {
-  const res = await fetchAny(url, { ...init, agent: pickAgent() });
+  // Attach dispatcher for Undici fetch (ignored by node-fetch)
+  const initWithDispatcher = (pickDispatcher())
+    ? { ...init, dispatcher: pickDispatcher() }
+    : init;
+
+  const res  = await fetchAny(url, initWithDispatcher);
   const text = await res.text();
   let json = null; try { json = JSON.parse(text); } catch {}
   return { ok: res.ok, status: res.status, text, json };
 }
 
 function joinUrl(base, prefix, path, q = '') {
-  const b = base.replace(/\/+$/,'');
-  const p = String(prefix || '').replace(/\/+$/,'');
-  const s = path.replace(/^\/+/, '');
+  const b  = base.replace(/\/+$/,'');
+  const p  = String(prefix || '').replace(/\/+$/,'');
+  const s  = path.replace(/^\/+/, '');
   const qp = q ? (q.startsWith('?') ? q : '?' + q) : '';
   return `${b}${p ? '/' + p.replace(/^\/+/, '') : ''}/${s}${qp}`;
 }
@@ -74,7 +92,7 @@ function joinUrl(base, prefix, path, q = '') {
 router.get('/_debug', (req, res) => {
   res.json({
     ok: true,
-    signature: 'meta-smart-dual-2025-08-22',
+    signature: 'meta-smart-dual-2025-08-22+undici',
     TOKEN: !!TOKEN,
     TOKEN_LEN: TOKEN ? TOKEN.length : 0,
     REGION,
@@ -82,7 +100,8 @@ router.get('/_debug', (req, res) => {
     CLIENT_BASES,
     CLIENT_PREFIXES,
     PROV_BASES,
-    PROV_PREFIXES
+    PROV_PREFIXES,
+    dispatcherType
   });
 });
 
@@ -90,19 +109,18 @@ router.get('/_tls', (req, res) => {
   res.json({
     ok: true,
     INSECURE_TLS: INSECURE,
-    agentType: proxyAgent ? 'HttpsProxyAgent' : 'https.Agent',
+    dispatcherType,
     PROXY_URL: process.env.METAAPI_HTTP_PROXY || null
   });
 });
 
-// ✅ NEW: quick env check for proxy-related variables
+// Quick env check for proxy-related variables
 router.get('/_env', (req, res) => {
   const keys = [
     'METAAPI_HTTP_PROXY','HTTP_PROXY','HTTPS_PROXY','ALL_PROXY','NO_PROXY',
     'http_proxy','https_proxy','all_proxy','no_proxy'
   ];
-  const out = {};
-  keys.forEach(k => { out[k] = process.env[k] || ''; });
+  const out = {}; keys.forEach(k => out[k] = process.env[k] || '');
   res.json({ ok: true, proxies: out });
 });
 
@@ -160,7 +178,6 @@ router.get('/accounts', async (req, res) => {
         attempts.push({ base:b, prefix:p, url, status:r.status, ok:r.ok, short: (r.text||'').slice(0, 200) });
         if (r.ok && Array.isArray(r.json?.items || r.json)) {
           const items = Array.isArray(r.json) ? r.json : r.json.items;
-          // optional: filter by ownerEmail tag
           const ownerEmail = String(req.query.ownerEmail || '').trim().toLowerCase();
           const filtered = ownerEmail
             ? items.filter(a => (a.tags || []).some(t => t.toLowerCase() === `owner:${ownerEmail}`))
@@ -173,7 +190,7 @@ router.get('/accounts', async (req, res) => {
     }
   }
 
-  // Fallback to Client list (some tokens expose accounts here)
+  // Fallback to Client list
   for (const b of CLIENT_BASES) {
     for (const p of CLIENT_PREFIXES) {
       const url = joinUrl(b, p, '/users/current/accounts');
@@ -221,7 +238,7 @@ router.get('/positions', async (req, res) => {
   res.status(502).json({ ok:false, stage:'positions', attempts });
 });
 
-// ---------- API: info (balance/equity etc.) ----------
+// ---------- API: info ----------
 router.get('/info', async (req, res) => {
   const accountId = String(req.query.accountId || '');
   if (!accountId) return res.status(400).json({ ok:false, error:'accountId required' });

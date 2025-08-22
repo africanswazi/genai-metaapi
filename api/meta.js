@@ -7,6 +7,11 @@ const TOKEN    = process.env.METAAPI_TOKEN || '';
 const INSECURE = String(process.env.METAAPI_INSECURE || '').trim() === '1';
 const REGION   = (process.env.METAAPI_REGION || 'london').toLowerCase();
 
+// When insecure mode is on, make sure *all* TLS checks are relaxed
+if (INSECURE) {
+  process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
+}
+
 // ---------- Undici dispatcher (preferred for Node 20 fetch) ----------
 let localDispatcher = null;
 let dispatcherType  = 'none';

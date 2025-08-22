@@ -9,10 +9,23 @@ require('dotenv').config();
   'http_proxy','https_proxy','all_proxy','no_proxy'
 ].forEach(k => { if (process.env[k]) delete process.env[k]; });
 
-// 3) Prefer IPv4 (shared hosts sometimes have flaky IPv6)
+// 3) Prefer IPv4 AND configure Undici TLS from METAAPI_INSECURE
 try {
   const dns = require('dns');
   if (dns.setDefaultResultOrder) dns.setDefaultResultOrder('ipv4first');
+
+  // Node 20 fetch uses undici → set a global dispatcher that prefers IPv4
+  // and optionally disables TLS verification when METAAPI_INSECURE=1
+  const { setGlobalDispatcher, Agent } = require('undici');
+  const insecure = String(process.env.METAAPI_INSECURE || '').trim() === '1';
+  const lookupIPv4 = (hostname, _opts, cb) => dns.lookup(hostname, { family: 4 }, cb);
+
+  setGlobalDispatcher(new Agent({
+    connect: {
+      lookup: lookupIPv4,
+      rejectUnauthorized: !insecure
+    }
+  }));
 } catch {}
 
 // 4) Web app
@@ -34,10 +47,10 @@ app.get(['/','/health','/api/health','/api/api/health'], (req,res) =>
 // 6) MetaApi routes (only)
 let metaRoutes;
 try {
-  metaRoutes = require('./api/meta');      // must export an express.Router()
+  metaRoutes = require('./api/meta'); // must export an express.Router()
 } catch (e) {
   console.error('Failed to load ./api/meta:', e.message);
-  // Build a tiny router that reports the failure but keeps the process alive
+  // Tiny fallback router so the process still runs
   metaRoutes = express.Router();
   metaRoutes.all('*', (req,res) =>
     res.status(500).json({ ok:false, error:'meta router failed to load', details: e.message })
@@ -49,7 +62,7 @@ try {
   .forEach(prefix => app.use(prefix, metaRoutes));
 
 // Alive pings for both bases
-['/api/meta/_alive', '/api/api/meta/_alive', '/api/metaapi/_alive', '/api/api/meta/_alive']
+['/api/meta/_alive', '/api/api/meta/_alive', '/api/metaapi/_alive', '/api/api/metaapi/_alive']
   .forEach(p => app.get(p, (req,res)=>res.json({ ok:true, from:'server', path:p, ts:Date.now() })));
 
 // JSON 404 inside the meta spaces (no HTML "Cannot GET")

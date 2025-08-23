@@ -1,267 +1,185 @@
-// api/meta.js
+// api/meta.js  — MetaApi bridge for your dashboard (provisioning + client)
+// Works with:
+//   METAAPI_PROVISIONING_BASE=https://mt-provisioning-api-v1.agiliumtrade.agiliumtrade.ai
+//   METAAPI_CLIENT_BASE=https://mt-client-api-v1.london.agiliumtrade.ai
+//   METAAPI_TOKEN=<your metaapi auth token>
+// Optional (you already set):
+//   METAAPI_REGION=london
+//   NO_PROXY / no_proxy to bypass proxies for *.agiliumtrade.ai / *.metaapi.cloud
+//
+// Endpoints exposed:
+//   GET    /api/meta/_probe
+//   GET    /api/meta/accounts                      (provisioning list)
+//   POST   /api/meta/accounts                      (provisioning create)
+//   POST   /api/meta/accounts/:id/deploy           (provisioning deploy)
+//   DELETE /api/meta/accounts/:id                  (provisioning delete)
+//   GET    /api/meta/accounts/:id/info             (client account-information)
+//   GET    /api/meta/accounts/:id/positions        (client positions)
+//   POST   /api/meta/accounts/:id/trade            (client trade passthrough)
+
 const express = require('express');
 const router  = express.Router();
 
+router.use(express.json({ limit: '1mb' }));
+
 // ---------- ENV ----------
-const TOKEN    = process.env.METAAPI_TOKEN || '';
-const INSECURE = String(process.env.METAAPI_INSECURE || '').trim() === '1';
-const REGION   = (process.env.METAAPI_REGION || 'london').toLowerCase();
+const TOKEN  = (process.env.METAAPI_TOKEN || '').trim();
+const PROV   = (process.env.METAAPI_PROVISIONING_BASE
+  || 'https://mt-provisioning-api-v1.agiliumtrade.agiliumtrade.ai').replace(/\/+$/,'');
+const CLIENT = (process.env.METAAPI_CLIENT_BASE
+  || 'https://mt-client-api-v1.london.agiliumtrade.ai').replace(/\/+$/,'');
+const REGION = (process.env.METAAPI_REGION || 'london').toLowerCase();
 
-// When insecure mode is on, make sure *all* TLS checks are relaxed
-if (INSECURE) {
-  process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
-}
+// ---------- Undici (Node 20) ----------
+const { request, Agent, ProxyAgent } = require('undici');
+const dns = require('dns');
+const lookupIPv4 = (host, _opts, cb) => dns.lookup(host, { family: 4 }, cb);
 
-// ---------- Undici dispatcher (preferred for Node 20 fetch) ----------
-let localDispatcher = null;
-let dispatcherType  = 'none';
-
-try {
-  const dns = require('dns');
-  const { Agent, ProxyAgent } = require('undici');
-  const lookupIPv4 = (host, _opts, cb) => dns.lookup(host, { family: 4 }, cb);
-
-  if (process.env.METAAPI_HTTP_PROXY) {
-    // Optional proxy support if you later set METAAPI_HTTP_PROXY
-    localDispatcher = new ProxyAgent(process.env.METAAPI_HTTP_PROXY, {
-      connect: { rejectUnauthorized: !INSECURE, lookup: lookupIPv4 }
-    });
-    dispatcherType = 'ProxyAgent';
-  } else {
-    localDispatcher = new Agent({
-      connect: { rejectUnauthorized: !INSECURE, lookup: lookupIPv4 }
-    });
-    dispatcherType = 'Agent';
+// Per-host dispatcher so MetaApi traffic NEVER goes through any proxy.
+const PROXY = (process.env.HTTPS_PROXY || process.env.HTTP_PROXY || '').trim();
+const directAgent = new Agent({
+  connect: { lookup: lookupIPv4, timeout: 15000, rejectUnauthorized: true },
+  headersTimeout: 20000,
+  bodyTimeout: 30000
+});
+const proxyAgent = PROXY ? new ProxyAgent(PROXY, { connect: { lookup: lookupIPv4 } }) : null;
+const isMetaHost = h => h.endsWith('agiliumtrade.ai') || h.endsWith('metaapi.cloud');
+function pickDispatcher(url) {
+  try {
+    const h = new URL(url).hostname;
+    return (proxyAgent && !isMetaHost(h)) ? proxyAgent : directAgent;
+  } catch {
+    return directAgent;
   }
-} catch {
-  // If undici isn't available for some reason, we just won't attach a dispatcher
-  localDispatcher = null;
-  dispatcherType  = 'none';
 }
 
-const pickDispatcher = () => localDispatcher || undefined;
-
-// ---------- fetch shim (Node 20 has global fetch) ----------
-const fetchAny = (...args) =>
-  (globalThis.fetch ? globalThis.fetch(...args)
-                    : import('node-fetch').then(({ default: f }) => f(...args)));
-
-const authHeaders = () => ({
-  'Authorization': `Bearer ${TOKEN}`,
-  'Content-Type': 'application/json'
-});
-
-// ---------- Bases & Prefixes (env-driven, with sane fallbacks) ----------
-const CLIENT_BASES = [
-  process.env.METAAPI_CLIENT_BASE || `https://mt-client-api-v1.${REGION}.agiliumtrade.ai`,
-  'https://api.metaapi.cloud'
-];
-
-const CLIENT_PREFIXES = [
-  process.env.METAAPI_CLIENT_PREFIX || '',   // some client hosts use no /v1
-  '/v1'
-];
-
-const PROV_BASES = [
-  process.env.METAAPI_PROVISIONING_BASE || 'https://api.metaapi.cloud',
-  'https://mt-provisioning-api-v1.agiliumtrade.ai'
-];
-
-const PROV_PREFIXES = [
-  process.env.METAAPI_PROVISIONING_PREFIX || '/provisioning/v1',
-  '/provisioning'
-];
-
-// ---------- helpers ----------
-async function tryFetch(url, init = {}) {
-  // Attach dispatcher for Undici fetch (ignored by node-fetch)
-  const initWithDispatcher = (pickDispatcher())
-    ? { ...init, dispatcher: pickDispatcher() }
-    : init;
-
-  const res  = await fetchAny(url, initWithDispatcher);
-  const text = await res.text();
-  let json = null; try { json = JSON.parse(text); } catch {}
-  return { ok: res.ok, status: res.status, text, json };
+// ---------- Helpers ----------
+function authHeaders(extra = {}) {
+  const h = { 'auth-token': TOKEN, ...extra };
+  return h;
 }
 
-function joinUrl(base, prefix, path, q = '') {
-  const b  = base.replace(/\/+$/,'');
-  const p  = String(prefix || '').replace(/\/+$/,'');
-  const s  = path.replace(/^\/+/, '');
-  const qp = q ? (q.startsWith('?') ? q : '?' + q) : '';
-  return `${b}${p ? '/' + p.replace(/^\/+/, '') : ''}/${s}${qp}`;
-}
-
-// ---------- Debug routes ----------
-router.get('/_debug', (req, res) => {
-  res.json({
-    ok: true,
-    signature: 'meta-smart-dual-2025-08-22+undici',
-    TOKEN: !!TOKEN,
-    TOKEN_LEN: TOKEN ? TOKEN.length : 0,
-    REGION,
-    INSECURE_TLS: INSECURE,
-    CLIENT_BASES,
-    CLIENT_PREFIXES,
-    PROV_BASES,
-    PROV_PREFIXES,
-    dispatcherType
+async function hit(url, opts = {}) {
+  const res = await request(url, {
+    dispatcher: pickDispatcher(url),
+    ...opts
   });
-});
+  const text = await res.body.text();
+  let json = null;
+  try { json = JSON.parse(text); } catch {}
+  return { status: res.statusCode, headers: Object.fromEntries(res.headers), text, json };
+}
 
-router.get('/_tls', (req, res) => {
-  res.json({
-    ok: true,
-    INSECURE_TLS: INSECURE,
-    dispatcherType,
-    PROXY_URL: process.env.METAAPI_HTTP_PROXY || null
-  });
-});
+function send(res, out) {
+  const code = out.status || 200;
+  const body = (out.json ?? out.text ?? '');
+  // pass Retry-After if present (rate limits)
+  const retryAfter = out.headers?.['retry-after'];
+  if (retryAfter) res.set('Retry-After', retryAfter);
+  if (typeof body === 'object') return res.status(code).json(body);
+  try { return res.status(code).json(JSON.parse(body)); } catch { return res.status(code).send(body); }
+}
 
-// Quick env check for proxy-related variables
-router.get('/_env', (req, res) => {
-  const keys = [
-    'METAAPI_HTTP_PROXY','HTTP_PROXY','HTTPS_PROXY','ALL_PROXY','NO_PROXY',
-    'http_proxy','https_proxy','all_proxy','no_proxy'
-  ];
-  const out = {}; keys.forEach(k => out[k] = process.env[k] || '');
-  res.json({ ok: true, proxies: out });
-});
+// ---------- Routes ----------
 
-// Quick external & path probe
+// Connectivity probe (only the two hosts you use)
 router.get('/_probe', async (req, res) => {
   const attempts = [];
-
-  // Provisioning probes
-  for (const b of PROV_BASES) {
-    for (const p of PROV_PREFIXES) {
-      const url = joinUrl(b, p, '/users/current/accounts');
-      try {
-        const r = await tryFetch(url, { headers: authHeaders() });
-        attempts.push({ type:'prov', base:b, prefix:p, url, status:r.status, ok:r.ok, body: (r.text||'').slice(0, 400) });
-        if (r.ok || r.status === 401 || r.status === 403) {
-          return res.json({ ok: true, via: 'prov', url, status: r.status });
-        }
-      } catch (e) {
-        attempts.push({ type:'prov', base:b, prefix:p, url, error: e.code || e.message });
-      }
+  const targets = [
+    { name: 'prov list',  url: `${PROV}/users/current/accounts` },
+    { name: 'client ping', url: `${CLIENT}/users/current` }
+  ];
+  for (const t of targets) {
+    try {
+      const out = await hit(t.url, { method: 'GET', headers: authHeaders() });
+      attempts.push({ name: t.name, url: t.url, status: out.status });
+    } catch (e) {
+      attempts.push({ name: t.name, url: t.url, error: e?.message || String(e) });
     }
   }
-
-  // Client probes
-  for (const b of CLIENT_BASES) {
-    for (const p of CLIENT_PREFIXES) {
-      const url = joinUrl(b, p, '/users/current/accounts');
-      try {
-        const r = await tryFetch(url, { headers: authHeaders() });
-        attempts.push({ type:'client', base:b, prefix:p, url, status:r.status, ok:r.ok, body: (r.text||'').slice(0, 400) });
-        if (r.ok || r.status === 401 || r.status === 403) {
-          return res.json({ ok: true, via: 'client', url, status: r.status });
-        }
-      } catch (e) {
-        attempts.push({ type:'client', base:b, prefix:p, url, error: e.code || e.message });
-      }
-    }
-  }
-
-  res.status(502).json({ ok:false, attempts });
+  res.json({ ok: attempts.some(a => a.status && a.status < 500), region: REGION, attempts });
 });
 
-// ---------- API: list accounts ----------
+// List accounts (Provisioning)
 router.get('/accounts', async (req, res) => {
-  if (!TOKEN) return res.status(400).json({ ok:false, error:'METAAPI_TOKEN missing' });
-
-  const attempts = [];
-
-  // Prefer Provisioning (authoritative list)
-  for (const b of PROV_BASES) {
-    for (const p of PROV_PREFIXES) {
-      const url = joinUrl(b, p, '/users/current/accounts');
-      try {
-        const r = await tryFetch(url, { headers: authHeaders() });
-        attempts.push({ base:b, prefix:p, url, status:r.status, ok:r.ok, short: (r.text||'').slice(0, 200) });
-        if (r.ok && Array.isArray(r.json?.items || r.json)) {
-          const items = Array.isArray(r.json) ? r.json : r.json.items;
-          const ownerEmail = String(req.query.ownerEmail || '').trim().toLowerCase();
-          const filtered = ownerEmail
-            ? items.filter(a => (a.tags || []).some(t => t.toLowerCase() === `owner:${ownerEmail}`))
-            : items;
-          return res.json({ ok:true, via:'prov', items: filtered });
-        }
-      } catch (e) {
-        attempts.push({ base:b, prefix:p, url, error: e.code || e.message });
-      }
-    }
-  }
-
-  // Fallback to Client list
-  for (const b of CLIENT_BASES) {
-    for (const p of CLIENT_PREFIXES) {
-      const url = joinUrl(b, p, '/users/current/accounts');
-      try {
-        const r = await tryFetch(url, { headers: authHeaders() });
-        attempts.push({ base:b, prefix:p, url, status:r.status, ok:r.ok, short: (r.text||'').slice(0, 200) });
-        if (r.ok && Array.isArray(r.json?.items || r.json)) {
-          const items = Array.isArray(r.json) ? r.json : r.json.items;
-          const ownerEmail = String(req.query.ownerEmail || '').trim().toLowerCase();
-          const filtered = ownerEmail
-            ? items.filter(a => (a.tags || []).some(t => t.toLowerCase() === `owner:${ownerEmail}`))
-            : items;
-          return res.json({ ok:true, via:'client', items: filtered });
-        }
-      } catch (e) {
-        attempts.push({ base:b, prefix:p, url, error: e.code || e.message });
-      }
-    }
-  }
-
-  res.status(502).json({ ok:false, stage:'list', attempts });
+  try { send(res, await hit(`${PROV}/users/current/accounts`, { headers: authHeaders() })); }
+  catch (e) { res.status(500).json({ error: 'proxy_error', message: e?.message || String(e) }); }
 });
 
-// ---------- API: positions ----------
-router.get('/positions', async (req, res) => {
-  const accountId = String(req.query.accountId || '');
-  if (!accountId) return res.status(400).json({ ok:false, error:'accountId required' });
-
-  const attempts = [];
-  for (const b of CLIENT_BASES) {
-    for (const p of CLIENT_PREFIXES) {
-      const url = joinUrl(b, p, `/users/current/accounts/${encodeURIComponent(accountId)}/positions`);
-      try {
-        const r = await tryFetch(url, { headers: authHeaders() });
-        attempts.push({ base:b, prefix:p, url, status:r.status, ok:r.ok });
-        if (r.ok) {
-          const items = Array.isArray(r.json) ? r.json : (Array.isArray(r.json?.items) ? r.json.items : []);
-          return res.json({ ok:true, items });
-        }
-      } catch (e) {
-        attempts.push({ base:b, prefix:p, url, error: e.code || e.message });
-      }
-    }
+// Create account (Provisioning)
+// If reliability not provided, default to "regular" to avoid the "top up" 403.
+router.post('/accounts', async (req, res) => {
+  const body = { reliability: 'regular', ...req.body };
+  const txId = req.get('transaction-id') || require('crypto').randomBytes(16).toString('hex');
+  try {
+    send(res, await hit(`${PROV}/users/current/accounts`, {
+      method: 'POST',
+      headers: authHeaders({ 'Content-Type': 'application/json', 'transaction-id': txId }),
+      body: JSON.stringify(body)
+    }));
+  } catch (e) {
+    res.status(500).json({ error: 'proxy_error', message: e?.message || String(e) });
   }
-  res.status(502).json({ ok:false, stage:'positions', attempts });
 });
 
-// ---------- API: info ----------
-router.get('/info', async (req, res) => {
-  const accountId = String(req.query.accountId || '');
-  if (!accountId) return res.status(400).json({ ok:false, error:'accountId required' });
-
-  const attempts = [];
-  for (const b of CLIENT_BASES) {
-    for (const p of CLIENT_PREFIXES) {
-      const url = joinUrl(b, p, `/users/current/accounts/${encodeURIComponent(accountId)}`);
-      try {
-        const r = await tryFetch(url, { headers: authHeaders() });
-        attempts.push({ base:b, prefix:p, url, status:r.status, ok:r.ok });
-        if (r.ok && r.json) return res.json({ ok:true, account: r.json });
-      } catch (e) {
-        attempts.push({ base:b, prefix:p, url, error: e.code || e.message });
-      }
-    }
+// Deploy account (Provisioning)
+router.post('/accounts/:id/deploy', async (req, res) => {
+  try {
+    send(res, await hit(`${PROV}/users/current/accounts/${req.params.id}/deploy`, {
+      method: 'POST',
+      headers: authHeaders()
+    }));
+  } catch (e) {
+    res.status(500).json({ error: 'proxy_error', message: e?.message || String(e) });
   }
-  res.status(502).json({ ok:false, stage:'info', attempts });
+});
+
+// Delete account (Provisioning)
+router.delete('/accounts/:id', async (req, res) => {
+  try {
+    send(res, await hit(`${PROV}/users/current/accounts/${req.params.id}`, {
+      method: 'DELETE',
+      headers: authHeaders()
+    }));
+  } catch (e) {
+    res.status(500).json({ error: 'proxy_error', message: e?.message || String(e) });
+  }
+});
+
+// Account info (Client)
+router.get('/accounts/:id/info', async (req, res) => {
+  try {
+    send(res, await hit(`${CLIENT}/users/current/accounts/${req.params.id}/account-information`, {
+      headers: authHeaders()
+    }));
+  } catch (e) {
+    res.status(500).json({ error: 'proxy_error', message: e?.message || String(e) });
+  }
+});
+
+// Positions (Client)
+router.get('/accounts/:id/positions', async (req, res) => {
+  try {
+    send(res, await hit(`${CLIENT}/users/current/accounts/${req.params.id}/positions`, {
+      headers: authHeaders()
+    }));
+  } catch (e) {
+    res.status(500).json({ error: 'proxy_error', message: e?.message || String(e) });
+  }
+});
+
+// Trade passthrough (Client)
+// Body is forwarded as-is to MetaApi; validate on your UI before calling.
+router.post('/accounts/:id/trade', async (req, res) => {
+  try {
+    send(res, await hit(`${CLIENT}/users/current/accounts/${req.params.id}/trade`, {
+      method: 'POST',
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify(req.body || {})
+    }));
+  } catch (e) {
+    res.status(500).json({ error: 'proxy_error', message: e?.message || String(e) });
+  }
 });
 
 module.exports = router;

@@ -44,13 +44,30 @@ app.get(['/','/health','/api/health','/api/api/health'], (req,res) =>
   res.json({ ok:true, ts: Date.now() })
 );
 
+// 5a) Meta-space health (checks env wiring)
+app.get(['/api/meta/health','/api/api/meta/health'], (req, res) => {
+  res.json({
+    ok: true,
+    ts: Date.now(),
+    node: process.version,
+    hasMetaToken: !!process.env.METAAPI_TOKEN,
+    metaBase: process.env.METAAPI_BASE || 'https://api.metaapi.cloud'
+  });
+});
+
 // 6) MetaApi routes (only)
 let metaRoutes;
 try {
-  metaRoutes = require('./api/meta'); // must export an express.Router()
+  const mod = require('./api/meta');                    // CJS or ESM default
+  metaRoutes = (mod && mod.default) ? mod.default : mod;
+
+  // sanity check it's an Express router
+  if (!metaRoutes || (typeof metaRoutes !== 'function' && !metaRoutes.stack)) {
+    throw new Error('api/meta did not export an Express router');
+  }
 } catch (e) {
   console.error('Failed to load ./api/meta:', e.message);
-  // Tiny fallback router so the process still runs
+  // Tiny fallback router so the process still runs and exposes the error as JSON
   metaRoutes = express.Router();
   metaRoutes.all('*', (req,res) =>
     res.status(500).json({ ok:false, error:'meta router failed to load', details: e.message })
@@ -70,6 +87,10 @@ try {
   .forEach(prefix => app.use(prefix, (req,res) =>
     res.status(404).json({ ok:false, error:'not found', path:req.originalUrl })
   ));
+
+// Global error logging (helpful for Azure Log Stream)
+process.on('unhandledRejection', e => console.error('UNHANDLED REJECTION', e));
+process.on('uncaughtException', e => console.error('UNCAUGHT EXCEPTION', e));
 
 // 7) Start
 app.listen(PORT, () => {

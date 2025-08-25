@@ -2,84 +2,107 @@
 const express = require('express');
 const router = express.Router();
 
-const METAAPI_BASE  = (process.env.METAAPI_BASE || 'https://api.metaapi.cloud').replace(/\/+$/, '');
+/** ========= Config (from env) =========
+ * Keep these as App Settings in Azure:
+ *   METAAPI_TOKEN                  = <your token>          (required)
+ *   METAAPI_CLIENT_BASE            = https://mt-client-api-v1.london.agiliumtrade.ai   (or new-york)
+ *   METAAPI_PROVISIONING_BASE      = https://mt-provisioning-api-v1.agiliumtrade.ai
+ * Optional:
+ *   METAAPI_INSECURE               = 0
+ */
 const METAAPI_TOKEN = process.env.METAAPI_TOKEN || '';
-const fetch = (global.fetch ? global.fetch.bind(global) : require('node-fetch'));
+const CLIENT_BASE   = process.env.METAAPI_CLIENT_BASE || 'https://mt-client-api-v1.london.agiliumtrade.ai';
+const PROV_BASE     = process.env.METAAPI_PROVISIONING_BASE || 'https://mt-provisioning-api-v1.agiliumtrade.ai';
 
-const ROUTER_VERSION = '2025-08-25T07:00Z';
-
-function needToken(res) {
-  if (!METAAPI_TOKEN) { res.status(500).json({ ok:false, error:'METAAPI_TOKEN not set' }); return true; }
-  return false;
-}
-
-async function metaFetch(path, init = {}) {
-  const url = METAAPI_BASE + path;
-  const headers = Object.assign({
+function authHeaders(extra = {}) {
+  return {
+    'Content-Type': 'application/json',
     'Authorization': `Bearer ${METAAPI_TOKEN}`,
-    'auth-token': METAAPI_TOKEN,      // some setups require this legacy header
-    'Content-Type': 'application/json'
-  }, init.headers || {});
-  const resp = await fetch(url, { ...init, headers });
-  const text = await resp.text();
-  let data; try { data = text ? JSON.parse(text) : null; } catch { data = { raw: text }; }
-  return { ok: resp.ok, status: resp.status, data, url };
+    ...extra
+  };
 }
 
-// Diagnostics (to prove THIS router is the one running)
+/** -------- Health / Diag -------- */
 router.get('/health', (req, res) => {
-  res.json({ ok:true, ts:Date.now(), node:process.version, hasMetaToken:!!METAAPI_TOKEN, metaBase:METAAPI_BASE, routerVersion: ROUTER_VERSION });
-});
-router.get('/diag', (req, res) => {
-  const env = process.env;
   res.json({
-    ok:true, routerVersion: ROUTER_VERSION,
-    suspectedProxyEnv: {
-      HTTP_PROXY: env.HTTP_PROXY||null, HTTPS_PROXY: env.HTTPS_PROXY||null, ALL_PROXY: env.ALL_PROXY||null, NO_PROXY: env.NO_PROXY||null,
-      http_proxy: env.http_proxy||null, https_proxy: env.https_proxy||null, all_proxy: env.all_proxy||null, no_proxy: env.no_proxy||null,
-      METAAPI_HTTP_PROXY: env.METAAPI_HTTP_PROXY||null,
+    ok: true,
+    ts: Date.now(),
+    router: 'meta-router v3',
+    hasMetaToken: !!METAAPI_TOKEN,
+    clientBase: CLIENT_BASE,
+    provisioningBase: PROV_BASE,
+    node: process.version
+  });
+});
+
+router.get('/diag', (req, res) => {
+  res.json({
+    ok: true,
+    routerVersion: 'v3',
+    env: {
+      hasMetaToken: !!METAAPI_TOKEN,
+      CLIENT_BASE,
+      PROV_BASE,
+      METAAPI_INSECURE: process.env.METAAPI_INSECURE || '0'
+    },
+    ipSeenByExpress: {
+      ip: req.ip,
+      ips: req.ips,
+      xff: req.headers['x-forwarded-for'] || null
     }
   });
 });
 
-// Accounts -> provisioning
+/** -------- Accounts (Provisioning API) --------
+ * Lists accounts tied to the token.
+ * Docs: https://metaapi.cloud/docs/client/restApi/api/provisioning/getAccounts/
+ */
 router.get('/accounts', async (req, res) => {
-  if (needToken(res)) return;
+  if (!METAAPI_TOKEN) return res.status(500).json({ ok:false, error:'missing_token' });
   try {
-    const r = await metaFetch('/users/current/accounts');
-    if (!r.ok) return res.status(r.status).json({ ok:false, upstream:r.data, url:r.url });
-    res.json(r.data || []);
-  } catch (e) { res.status(502).json({ ok:false, error:'upstream_error', details:String(e) }); }
+    const r = await fetch(`${PROV_BASE}/users/current/accounts`, { headers: authHeaders() });
+    const body = await r.json().catch(() => ({}));
+    res.status(r.status).json(body);
+  } catch (e) {
+    res.status(502).json({ ok:false, error:'fetch_failed', detail: String(e) });
+  }
 });
 
-// Positions
+/** -------- Positions (Client API) --------
+ * Requires an accountId. CLIENT_BASE must match the account region (london or new-york).
+ * Docs: https://metaapi.cloud/docs/client/restApi/api/readTradingTerminalState/readPositions/
+ */
 router.get('/positions', async (req, res) => {
-  if (needToken(res)) return;
-  const id = String(req.query.accountId||'').trim();
-  if (!id) return res.status(400).json({ ok:false, error:'accountId is required' });
+  if (!METAAPI_TOKEN) return res.status(500).json({ ok:false, error:'missing_token' });
+  const accountId = String(req.query.accountId || '').trim();
+  if (!accountId) return res.status(400).json({ ok:false, error:'accountId_required' });
+
   try {
-    const r = await metaFetch(`/users/current/accounts/${encodeURIComponent(id)}/positions`);
-    if (!r.ok) return res.status(r.status).json({ ok:false, upstream:r.data, url:r.url });
-    res.json(r.data || []);
-  } catch (e) { res.status(502).json({ ok:false, error:'upstream_error', details:String(e) }); }
+    const url = `${CLIENT_BASE}/users/current/accounts/${encodeURIComponent(accountId)}/positions`;
+    const r = await fetch(url, { headers: authHeaders() });
+    const body = await r.json().catch(() => ({}));
+    res.status(r.status).json(body);
+  } catch (e) {
+    res.status(502).json({ ok:false, error:'fetch_failed', detail: String(e) });
+  }
 });
 
-// Account info
+/** -------- Account info/state (Client API) --------
+ * Returns terminal state snapshot for the account.
+ */
 router.get('/info', async (req, res) => {
-  if (needToken(res)) return;
-  const id = String(req.query.accountId||'').trim();
-  if (!id) return res.status(400).json({ ok:false, error:'accountId is required' });
-  try {
-    const r = await metaFetch(`/users/current/accounts/${encodeURIComponent(id)}/accountInformation`);
-    if (!r.ok) return res.status(r.status).json({ ok:false, upstream:r.data, url:r.url });
-    res.json(r.data || {});
-  } catch (e) { res.status(502).json({ ok:false, error:'upstream_error', details:String(e) }); }
-});
+  if (!METAAPI_TOKEN) return res.status(500).json({ ok:false, error:'missing_token' });
+  const accountId = String(req.query.accountId || '').trim();
+  if (!accountId) return res.status(400).json({ ok:false, error:'accountId_required' });
 
-// Stubs (implement later)
-router.post('/accounts', (req,res)=>res.status(501).json({ ok:false, error:'not_implemented' }));
-router.post('/order',   (req,res)=>res.status(501).json({ ok:false, error:'not_implemented' }));
-router.post('/close',   (req,res)=>res.status(501).json({ ok:false, error:'not_implemented' }));
-router.post('/modify',  (req,res)=>res.status(501).json({ ok:false, error:'not_implemented' }));
+  try {
+    const url = `${CLIENT_BASE}/users/current/accounts/${encodeURIComponent(accountId)}/state`;
+    const r = await fetch(url, { headers: authHeaders() });
+    const body = await r.json().catch(() => ({}));
+    res.status(r.status).json(body);
+  } catch (e) {
+    res.status(502).json({ ok:false, error:'fetch_failed', detail: String(e) });
+  }
+});
 
 module.exports = router;

@@ -1,120 +1,85 @@
 // api/meta/index.js
-// Minimal MetaApi router used by server.js
-
 const express = require('express');
 const router = express.Router();
 
-// ---- Config from env ----
-const META_BASE = (process.env.METAAPI_BASE || 'https://api.metaapi.cloud').replace(/\/+$/, '');
-const TOKEN     = process.env.METAAPI_TOKEN || '';
+const METAAPI_BASE  = (process.env.METAAPI_BASE || 'https://api.metaapi.cloud').replace(/\/$/, '');
+const METAAPI_TOKEN = process.env.METAAPI_TOKEN || '';
 
-// helper: call MetaApi Cloud with Bearer auth
-async function metaFetch(path, init = {}) {
-  const url = `${META_BASE}${path}`;
-  const headers = { 'Content-Type': 'application/json', ...(init.headers || {}) };
-  if (TOKEN) headers.Authorization = `Bearer ${TOKEN}`;
-  const opts = { method: 'GET', ...init, headers };
-
-  const r = await fetch(url, opts);
-  const text = await r.text();
-  let data; try { data = JSON.parse(text); } catch { data = { raw: text }; }
-  return { status: r.status, data, url };
+function ensureToken(res) {
+  if (!METAAPI_TOKEN) {
+    res.status(500).json({ ok:false, error: 'METAAPI_TOKEN not set on server' });
+    return false;
+  }
+  return true;
 }
 
-// health for this router
+async function metaFetch(path, init = {}) {
+  const url = METAAPI_BASE + path;
+  const headers = Object.assign(
+    { 'Authorization': `Bearer ${METAAPI_TOKEN}`, 'Content-Type': 'application/json' },
+    init.headers || {}
+  );
+  const resp = await fetch(url, { ...init, headers });
+  const text = await resp.text();
+  let data;
+  try { data = text ? JSON.parse(text) : null; } catch { data = { raw: text }; }
+  return { ok: resp.ok, status: resp.status, data };
+}
+
+/** Health for this router (in addition to server-level health) */
 router.get('/health', (req, res) => {
-  res.json({ ok: true, ts: Date.now(), node: process.version, hasMetaToken: !!TOKEN, metaBase: META_BASE });
+  res.json({
+    ok: true,
+    ts: Date.now(),
+    node: process.version,
+    hasMetaToken: !!METAAPI_TOKEN,
+    metaBase: METAAPI_BASE
+  });
 });
 
-// GET /api/meta/accounts?ownerEmail=... (ownerEmail is ignored; MetaApi uses token)
+/** GET /api/meta/accounts → MetaApi: /users/current/accounts */
 router.get('/accounts', async (req, res) => {
+  if (!ensureToken(res)) return;
   try {
-    const out = await metaFetch('/users/current/accounts');
-    res.status(out.status).json(out.data);
+    const r = await metaFetch('/users/current/accounts');
+    res.status(r.status).json(r.data ?? { ok: r.ok });
   } catch (e) {
-    res.status(500).json({ ok:false, error:'upstream_error', message:e.message });
+    res.status(502).json({ ok:false, error:'upstream_error', details:String(e) });
   }
 });
 
-// GET /api/meta/positions?accountId=...
+/** GET /api/meta/positions?accountId=... → MetaApi: /users/current/accounts/{id}/positions */
 router.get('/positions', async (req, res) => {
+  if (!ensureToken(res)) return;
   const id = String(req.query.accountId || '').trim();
-  if (!id) return res.status(400).json({ ok:false, error:'accountId required' });
+  if (!id) return res.status(400).json({ ok:false, error:'accountId is required' });
   try {
-    const out = await metaFetch(`/users/current/accounts/${encodeURIComponent(id)}/positions`);
-    res.status(out.status).json(out.data);
+    const r = await metaFetch(`/users/current/accounts/${encodeURIComponent(id)}/positions`);
+    res.status(r.status).json(r.data ?? { ok: r.ok });
   } catch (e) {
-    res.status(500).json({ ok:false, error:'upstream_error', message:e.message });
+    res.status(502).json({ ok:false, error:'upstream_error', details:String(e) });
   }
 });
 
-// GET /api/meta/info?accountId=...
+/** GET /api/meta/info?accountId=... → MetaApi: /users/current/accounts/{id}/accountInformation */
 router.get('/info', async (req, res) => {
+  if (!ensureToken(res)) return;
   const id = String(req.query.accountId || '').trim();
-  if (!id) return res.status(400).json({ ok:false, error:'accountId required' });
+  if (!id) return res.status(400).json({ ok:false, error:'accountId is required' });
   try {
-    const out = await metaFetch(`/users/current/accounts/${encodeURIComponent(id)}`);
-    res.status(out.status).json(out.data);
+    const r = await metaFetch(`/users/current/accounts/${encodeURIComponent(id)}/accountInformation`);
+    res.status(r.status).json(r.data ?? { ok: r.ok });
   } catch (e) {
-    res.status(500).json({ ok:false, error:'upstream_error', message:e.message });
+    res.status(502).json({ ok:false, error:'upstream_error', details:String(e) });
   }
 });
 
-// POST /api/meta/order   { accountId, symbol, side, lots, sl?, tp? }
-router.post('/order', async (req, res) => {
-  const { accountId, symbol, side, lots, sl, tp } = req.body || {};
-  if (!accountId || !symbol || typeof lots !== 'number') {
-    return res.status(400).json({ ok:false, error:'accountId, symbol, lots are required' });
-  }
-  try {
-    const body = { symbol, type:'POSITION', side:(String(side).toUpperCase()==='SELL'?'SELL':'BUY'), volume: lots };
-    if (typeof sl === 'number') body.stopLoss = sl;
-    if (typeof tp === 'number') body.takeProfit = tp;
-
-    const out = await metaFetch(`/users/current/accounts/${encodeURIComponent(accountId)}/orders`, {
-      method: 'POST', body: JSON.stringify(body)
-    });
-    res.status(out.status).json(out.data);
-  } catch (e) {
-    res.status(500).json({ ok:false, error:'upstream_error', message:e.message });
-  }
+/** Stubs so WP doesn’t 404 while you wire trading calls later */
+router.post('/accounts', (req, res) => {
+  res.status(501).json({ ok:false, error:'not_implemented', hint:'Create account via MetaApi SDK or REST here' });
 });
-
-// POST /api/meta/close   { accountId, positionId, lots? }
-router.post('/close', async (req, res) => {
-  const { accountId, positionId, lots } = req.body || {};
-  if (!accountId || !positionId) return res.status(400).json({ ok:false, error:'accountId and positionId are required' });
-  try {
-    const body = { positionId };
-    if (typeof lots === 'number') body.volume = lots;
-    const out = await metaFetch(`/users/current/accounts/${encodeURIComponent(accountId)}/positions/${encodeURIComponent(positionId)}/close`, {
-      method: 'POST', body: JSON.stringify(body)
-    });
-    res.status(out.status).json(out.data);
-  } catch (e) {
-    res.status(500).json({ ok:false, error:'upstream_error', message:e.message });
-  }
-});
-
-// POST /api/meta/modify  { accountId, positionId, sl?, tp? }
-router.post('/modify', async (req, res) => {
-  const { accountId, positionId, sl, tp } = req.body || {};
-  if (!accountId || !positionId) return res.status(400).json({ ok:false, error:'accountId and positionId are required' });
-  if (typeof sl !== 'number' && typeof tp !== 'number') return res.status(400).json({ ok:false, error:'provide sl or tp' });
-  try {
-    const body = {};
-    if (typeof sl === 'number') body.stopLoss = sl;
-    if (typeof tp === 'number') body.takeProfit = tp;
-    const out = await metaFetch(`/users/current/accounts/${encodeURIComponent(accountId)}/positions/${encodeURIComponent(positionId)}`, {
-      method: 'PATCH', body: JSON.stringify(body)
-    });
-    res.status(out.status).json(out.data);
-  } catch (e) {
-    res.status(500).json({ ok:false, error:'upstream_error', message:e.message });
-  }
-});
-
-// JSON 404 for this router
-router.use((req, res) => res.status(404).json({ ok:false, error:'not_found', path:req.originalUrl }));
+router.post('/order',  (req,res)=> res.status(501).json({ ok:false, error:'not_implemented' }));
+router.post('/close',  (req,res)=> res.status(501).json({ ok:false, error:'not_implemented' }));
+router.post('/modify', (req,res)=> res.status(501).json({ ok:false, error:'not_implemented' }));
 
 module.exports = router;

@@ -6,7 +6,7 @@ const METAAPI_BASE  = (process.env.METAAPI_BASE || 'https://api.metaapi.cloud').
 const METAAPI_TOKEN = process.env.METAAPI_TOKEN || '';
 const fetch = (global.fetch ? global.fetch.bind(global) : require('node-fetch'));
 
-const ROUTER_VERSION = '2025-08-25T07:00Z'; // helps you verify deployment
+const ROUTER_VERSION = '2025-08-25T07:00Z';
 
 function needToken(res) {
   if (!METAAPI_TOKEN) { res.status(500).json({ ok:false, error:'METAAPI_TOKEN not set' }); return true; }
@@ -17,7 +17,7 @@ async function metaFetch(path, init = {}) {
   const url = METAAPI_BASE + path;
   const headers = Object.assign({
     'Authorization': `Bearer ${METAAPI_TOKEN}`,
-    'auth-token': METAAPI_TOKEN,            // legacy header some setups still accept
+    'auth-token': METAAPI_TOKEN,      // some setups require this legacy header
     'Content-Type': 'application/json'
   }, init.headers || {});
   const resp = await fetch(url, { ...init, headers });
@@ -26,7 +26,7 @@ async function metaFetch(path, init = {}) {
   return { ok: resp.ok, status: resp.status, data, url };
 }
 
-// health + diag (to prove THIS router is live)
+// Diagnostics (to prove THIS router is the one running)
 router.get('/health', (req, res) => {
   res.json({ ok:true, ts:Date.now(), node:process.version, hasMetaToken:!!METAAPI_TOKEN, metaBase:METAAPI_BASE, routerVersion: ROUTER_VERSION });
 });
@@ -42,7 +42,7 @@ router.get('/diag', (req, res) => {
   });
 });
 
-// GET /api/meta/accounts  -> /users/current/accounts
+// Accounts -> provisioning
 router.get('/accounts', async (req, res) => {
   if (needToken(res)) return;
   try {
@@ -52,7 +52,7 @@ router.get('/accounts', async (req, res) => {
   } catch (e) { res.status(502).json({ ok:false, error:'upstream_error', details:String(e) }); }
 });
 
-// GET /api/meta/positions?accountId=ID  -> /users/current/accounts/{id}/positions
+// Positions
 router.get('/positions', async (req, res) => {
   if (needToken(res)) return;
   const id = String(req.query.accountId||'').trim();
@@ -64,7 +64,7 @@ router.get('/positions', async (req, res) => {
   } catch (e) { res.status(502).json({ ok:false, error:'upstream_error', details:String(e) }); }
 });
 
-// GET /api/meta/info?accountId=ID  -> /users/current/accounts/{id}/accountInformation
+// Account info
 router.get('/info', async (req, res) => {
   if (needToken(res)) return;
   const id = String(req.query.accountId||'').trim();
@@ -76,7 +76,7 @@ router.get('/info', async (req, res) => {
   } catch (e) { res.status(502).json({ ok:false, error:'upstream_error', details:String(e) }); }
 });
 
-// Stubs for later
+// Stubs (implement later)
 router.post('/accounts', (req,res)=>res.status(501).json({ ok:false, error:'not_implemented' }));
 router.post('/order',   (req,res)=>res.status(501).json({ ok:false, error:'not_implemented' }));
 router.post('/close',   (req,res)=>res.status(501).json({ ok:false, error:'not_implemented' }));

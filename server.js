@@ -1,95 +1,62 @@
 // server.js — minimal MetaApi-only server for Azure
 
-// 1) Load env
 require('dotenv').config();
+const express = require('express');
+const app = express();
 
-// 2) Nuke any proxy envs (some hosts inject these)
-[
-  'METAAPI_HTTP_PROXY','HTTP_PROXY','HTTPS_PROXY','ALL_PROXY','NO_PROXY',
-  'http_proxy','https_proxy','all_proxy','no_proxy'
-].forEach(k => { if (process.env[k]) delete process.env[k]; });
-
-// 3) Prefer IPv4 AND configure Undici TLS from METAAPI_INSECURE
+// ---- Prefer IPv4 (Azure + Node 20) ----
 try {
   const dns = require('dns');
   if (dns.setDefaultResultOrder) dns.setDefaultResultOrder('ipv4first');
-
-  // Node 20 fetch uses undici → set a global dispatcher that prefers IPv4
-  // and optionally disables TLS verification when METAAPI_INSECURE=1
-  const { setGlobalDispatcher, Agent } = require('undici');
-  const insecure = String(process.env.METAAPI_INSECURE || '').trim() === '1';
-  const lookupIPv4 = (hostname, _opts, cb) => dns.lookup(hostname, { family: 4 }, cb);
-
-  setGlobalDispatcher(new Agent({
-    connect: {
-      lookup: lookupIPv4,
-      rejectUnauthorized: !insecure
-    }
-  }));
 } catch {}
 
-// 4) Web app
-const express = require('express');
-const path = require('path');
-const app = express();
-const PORT = process.env.PORT || 3000;
+// ---- Undici agent (for future use / TLS flags) ----
+let dispatcher = null;
+try {
+  const { Agent } = require('undici');
+  const insecure = String(process.env.METAAPI_INSECURE || '').trim() === '1';
+  dispatcher = new Agent({
+    connect: { rejectUnauthorized: !insecure }
+  });
+  // If you later need: globalThis.fetch = (url, opts={}) => fetch(url, { dispatcher, ...opts });
+} catch {}
 
-app.set('trust proxy', true);
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
-app.use(express.static(path.join(__dirname, 'public')));
+// ---- Basic middleware ----
+app.disable('x-powered-by');
+app.use(express.json({ limit: '1mb' }));
 
-// 5) Health
-app.get(['/','/health','/api/health','/api/api/health'], (req,res) =>
-  res.json({ ok:true, ts: Date.now() })
-);
-
-// 5a) Meta-space health (checks env wiring)
-app.get(['/api/meta/health','/api/api/meta/health'], (req, res) => {
+// ---- Health & root checks ----
+app.get('/', (_req, res) => {
   res.json({
     ok: true,
-    ts: Date.now(),
+    name: 'genai-metaapi',
     node: process.version,
-    hasMetaToken: !!process.env.METAAPI_TOKEN,
-    metaBase: process.env.METAAPI_BASE || 'https://api.metaapi.cloud'
+    env: {
+      has_METAAPI_TOKEN: !!process.env.METAAPI_TOKEN,
+      region_hint: process.env.METAAPI_CLIENT_BASE || '',
+    }
   });
 });
 
-// 6) MetaApi routes (only)
-let metaRoutes;
-try {
-  // force the folder's index.js, not api/meta.js
-  metaRoutes = require('./api/meta/index.js'); // must export an express.Router()
-  console.log('Loaded meta router from ./api/meta/index.js');
-} catch (e) {
-  console.error('Failed to load ./api/meta/index.js:', e.message);
-  metaRoutes = require('express').Router();
-  metaRoutes.all('*', (req,res) =>
-    res.status(500).json({ ok:false, error:'meta router failed to load', details: e.message })
-  );
-}
+// ---- Mount meta router on /api/meta (and a double-prefix safety) ----
+const metaRouter = require('./api/meta');
+app.use('/api/meta', metaRouter);
+app.use('/api/api/meta', metaRouter); // in case your WP proxy double-prefixes
 
-
-// Mount under both base paths we use from WP
+// ---- 404 for unknown API paths we care about ----
 ['/api/meta', '/api/api/meta', '/api/metaapi', '/api/api/metaapi']
-  .forEach(prefix => app.use(prefix, metaRoutes));
+  .forEach(prefix => {
+    app.use(prefix, (req, res) => {
+      res.status(404).json({ ok: false, error: 'not found', path: req.originalUrl });
+    });
+  });
 
-// Alive pings for both bases
-['/api/meta/_alive', '/api/api/meta/_alive', '/api/metaapi/_alive', '/api/api/metaapi/_alive']
-  .forEach(p => app.get(p, (req,res)=>res.json({ ok:true, from:'server', path:p, ts:Date.now() })));
-
-// JSON 404 inside the meta spaces (no HTML "Cannot GET")
-['/api/meta', '/api/api/meta', '/api/metaapi', '/api/api/metaapi']
-  .forEach(prefix => app.use(prefix, (req,res) =>
-    res.status(404).json({ ok:false, error:'not found', path:req.originalUrl })
-  ));
-
-// Global error logging (helpful for Azure Log Stream)
+// ---- Global error logging (Log Stream visibility) ----
 process.on('unhandledRejection', e => console.error('UNHANDLED REJECTION', e));
 process.on('uncaughtException', e => console.error('UNCAUGHT EXCEPTION', e));
 
-// 7) Start
+// ---- Start ----
+const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
   console.log(`🚀 Azure server started on ${PORT}`);
 });
-

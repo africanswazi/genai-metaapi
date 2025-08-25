@@ -58,21 +58,17 @@ app.get(['/api/meta/health','/api/api/meta/health'], (req, res) => {
 // 6) MetaApi routes (only)
 let metaRoutes;
 try {
-  const mod = require('./api/meta');                    // CJS or ESM default
-  metaRoutes = (mod && mod.default) ? mod.default : mod;
-
-  // sanity check it's an Express router
-  if (!metaRoutes || (typeof metaRoutes !== 'function' && !metaRoutes.stack)) {
-    throw new Error('api/meta did not export an Express router');
-  }
+  // force the folder's index.js, not api/meta.js
+  metaRoutes = require('./api/meta/index.js'); // must export an express.Router()
+  console.log('Loaded meta router from ./api/meta/index.js');
 } catch (e) {
-  console.error('Failed to load ./api/meta:', e.message);
-  // Tiny fallback router so the process still runs and exposes the error as JSON
-  metaRoutes = express.Router();
+  console.error('Failed to load ./api/meta/index.js:', e.message);
+  metaRoutes = require('express').Router();
   metaRoutes.all('*', (req,res) =>
     res.status(500).json({ ok:false, error:'meta router failed to load', details: e.message })
   );
 }
+
 
 // Mount under both base paths we use from WP
 ['/api/meta', '/api/api/meta', '/api/metaapi', '/api/api/metaapi']
@@ -96,3 +92,4 @@ process.on('uncaughtException', e => console.error('UNCAUGHT EXCEPTION', e));
 app.listen(PORT, () => {
   console.log(`🚀 Azure server started on ${PORT}`);
 });
+
